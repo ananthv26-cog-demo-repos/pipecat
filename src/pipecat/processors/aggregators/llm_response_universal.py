@@ -91,7 +91,12 @@ from pipecat.processors.aggregators.llm_context_summarizer import (
     LLMContextSummarizer,
     SummaryAppliedEvent,
 )
-from pipecat.processors.frame_processor import FrameDirection, FrameProcessor, FrameProcessorSetup
+from pipecat.processors.frame_processor import (
+    FrameCallback,
+    FrameDirection,
+    FrameProcessor,
+    FrameProcessorSetup,
+)
 from pipecat.services.stt_latency import DEFAULT_TTFS_P99
 from pipecat.turns.empty_user_turn import EmptyUserTurnConfig
 from pipecat.turns.types import UserTurnSpeculation
@@ -1565,10 +1570,18 @@ class _AssistantInterruptionBarrierFrame(DataFrame):
     ``InterruptionFrame`` is a system frame, so it is handled ahead of any
     ``TTSTextFrame`` still waiting in the assistant aggregator's input queue.
     Those words were already released by the output transport, which means the
-    user heard them. The aggregator queues this frame to itself on
-    interruption so the turn is closed only after that text is aggregated.
+    user heard them. The aggregator queues this frame right behind every
+    ``InterruptionFrame`` it receives, so it lands after the text that was
+    already waiting and before anything that arrives later. The turn is closed,
+    and the interruption forwarded, when this frame is processed.
+
+    Parameters:
+        interruption: The interruption that closed the turn.
+        direction: The direction the interruption was travelling in.
     """
 
+    interruption: InterruptionFrame
+    direction: FrameDirection
     interruptible: bool = field(default=False, init=False)
 
 
@@ -1732,6 +1745,28 @@ class LLMAssistantAggregator(LLMContextAggregator):
         self._thought_llm = ""
         self._thought_aggregation = []
 
+    async def queue_frame(
+        self,
+        frame: Frame,
+        direction: FrameDirection = FrameDirection.DOWNSTREAM,
+        callback: FrameCallback | None = None,
+    ):
+        """Queue a frame for processing.
+
+        Every ``InterruptionFrame`` is followed by an internal barrier frame so
+        the interrupted turn keeps the text that was queued ahead of it.
+
+        Args:
+            frame: The frame to queue.
+            direction: The direction of frame flow.
+            callback: Optional callback to call after processing.
+        """
+        await super().queue_frame(frame, direction, callback)
+        if isinstance(frame, InterruptionFrame):
+            await super().queue_frame(
+                _AssistantInterruptionBarrierFrame(interruption=frame, direction=direction)
+            )
+
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Process frames for assistant response aggregation and function call management.
 
@@ -1747,15 +1782,14 @@ class LLMAssistantAggregator(LLMContextAggregator):
             await self.push_frame(frame, direction)
             await self._start(frame)
         elif isinstance(frame, InterruptionFrame):
-            await self._handle_interruptions(frame)
-            await self.push_frame(frame, direction)
+            await self._handle_interruptions(frame, direction)
         elif isinstance(frame, (EndFrame, CancelFrame)):
             await self._handle_end_or_cancel(frame)
             await self.push_frame(frame, direction)
         elif isinstance(frame, LLMAssistantPushAggregationFrame):
             await self._handle_push_aggregation()
         elif isinstance(frame, _AssistantInterruptionBarrierFrame):
-            await self._handle_interruption_barrier()
+            await self._handle_interruption_barrier(frame)
         elif isinstance(frame, TTSStartedFrame):
             await self._handle_tts_started(frame)
             await self.push_frame(frame, direction)
@@ -1919,16 +1953,15 @@ class LLMAssistantAggregator(LLMContextAggregator):
         if frame.run_llm:
             await self.push_context_frame(FrameDirection.UPSTREAM)
 
-    async def _handle_interruptions(self, frame: InterruptionFrame):
+    async def _handle_interruptions(self, frame: InterruptionFrame, direction: FrameDirection):
+        # The turn is closed by the barrier queued behind this frame.
         if self._assistant_turn_start_timestamp:
             self._assistant_turn_interrupted = True
-        # Text frames queued before the interruption reached us must still land
-        # in the interrupted turn, so close it from behind them.
-        await self.queue_frame(_AssistantInterruptionBarrierFrame())
 
-    async def _handle_interruption_barrier(self):
+    async def _handle_interruption_barrier(self, frame: _AssistantInterruptionBarrierFrame):
         await self._trigger_assistant_turn_stopped(interrupted=True)
         await self.reset()
+        await self.push_frame(frame.interruption, frame.direction)
 
     async def _handle_end_or_cancel(self, frame: Frame):
         await self._trigger_assistant_turn_stopped(interrupted=isinstance(frame, CancelFrame))
