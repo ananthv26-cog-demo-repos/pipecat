@@ -1,0 +1,30 @@
+initialize: |
+  sudo apt-get update -qq
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq pulseaudio pulseaudio-utils alsa-utils espeak-ng ffmpeg
+
+maintenance: |
+  uv sync --group dev --all-extras --no-extra gstreamer --no-extra local
+  uv run pre-commit install
+  # Prefetch the local voice models so the first call doesn't wait on downloads.
+  uv run python -c "from pipecat.services.kokoro.tts import KOKORO_CACHE_DIR as d, _ensure_model_files as f; f(d / 'kokoro-v1.0.onnx', d / 'voices-v1.0.bin')"
+  uv run python -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8')"
+  uv run --with playwright python -c "import playwright"
+
+knowledge:
+  - name: setup
+    contents: |
+      Python >=3.11, managed with uv. Pre-commit runs ruff, ruff-format and pyright.
+  - name: test
+    contents: |
+      uv run pytest                              # full suite
+      uv run pytest tests/test_name.py -q        # one file
+  - name: lint
+    contents: |
+      uv run ruff check && uv run ruff format --check && uv run pyright
+  - name: local-voice
+    contents: |
+      Reproduce voice bugs on a real call with no cloud voice keys (needs FIREWORKS_API_KEY):
+        uv run python .devin/local-voice/bot.py -t webrtc            # Playground at http://localhost:7860/client
+        uv run python .devin/local-voice/make_caller_audio.py --text "..." --delay 6 --out /tmp/caller.wav
+        uv run --with playwright python .devin/local-voice/caller.py --audio /tmp/caller.wav --seconds 45 --headed
+      The bot logs every assistant turn (ASSISTANT TURN ...) and the full context on disconnect.
