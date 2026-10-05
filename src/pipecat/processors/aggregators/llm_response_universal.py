@@ -69,6 +69,7 @@ from pipecat.frames.frames import (
     TranscriptionFrame,
     TranslationFrame,
     TTSStartedFrame,
+    TTSTextFrame,
     UserImageRawFrame,
     UserMuteStartedFrame,
     UserMuteStoppedFrame,
@@ -1753,14 +1754,19 @@ class LLMAssistantAggregator(LLMContextAggregator):
     ):
         """Queue a frame for processing.
 
-        Every ``InterruptionFrame`` is followed by an internal barrier frame so
-        the interrupted turn keeps the text that was queued ahead of it.
+        ``TTSTextFrame``s are released by the output transport as their audio
+        plays, so the user has heard them by the time they get here. They are
+        made uninterruptible so an interruption can't drop them from the queue,
+        and every ``InterruptionFrame`` is followed by an internal barrier frame
+        so the interrupted turn keeps the text that was queued ahead of it.
 
         Args:
             frame: The frame to queue.
             direction: The direction of frame flow.
             callback: Optional callback to call after processing.
         """
+        if isinstance(frame, TTSTextFrame):
+            frame.interruptible = False
         await super().queue_frame(frame, direction, callback)
         if isinstance(frame, InterruptionFrame):
             await super().queue_frame(

@@ -4,9 +4,11 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+import asyncio
 import io
 import json
 import unittest
+from dataclasses import dataclass, field
 
 from loguru import logger
 
@@ -15,6 +17,7 @@ from pipecat.adapters.schemas.tools_schema import AdapterType, ToolsSchema
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
+    DataFrame,
     Frame,
     FunctionCallCancelFrame,
     FunctionCallFromLLM,
@@ -1994,6 +1997,63 @@ class TestLLMAssistantAggregator(unittest.IsolatedAsyncioTestCase):
             context.messages[-1],
             {"role": "assistant", "content": "Hello, how can I help?"},
         )
+
+    async def test_interruption_keeps_tts_text_queued_behind_busy_processing(self):
+        # Words the output transport released while the aggregator was still
+        # busy with an earlier frame sit in its processing queue. An
+        # interruption flushes interruptible frames from that queue, but these
+        # words were heard and belong to the interrupted turn.
+        @dataclass
+        class SlowFrame(DataFrame):
+            interruptible: bool = field(default=False, init=False)
+
+        class BusyAggregator(LLMAssistantAggregator):
+            async def process_frame(self, frame, direction):
+                if isinstance(frame, SlowFrame):
+                    await asyncio.sleep(0.1)
+                    return
+                await super().process_frame(frame, direction)
+
+        context = LLMContext()
+        aggregator = BusyAggregator(context)
+
+        stop_messages = []
+
+        @aggregator.event_handler("on_assistant_turn_stopped")
+        async def on_assistant_turn_stopped(aggregator, message: AssistantTurnStoppedMessage):
+            stop_messages.append(message)
+
+        frames_to_send = [
+            LLMFullResponseStartFrame(),
+            TTSStartedFrame(),
+            TTSTextFrame(text="The", aggregated_by="word"),
+            TTSTextFrame(text="pool", aggregated_by="word"),
+            TTSTextFrame(text="opens", aggregated_by="word"),
+            SleepFrame(0.05),
+            SlowFrame(),
+            SleepFrame(0.02),
+            TTSTextFrame(text="at", aggregated_by="word"),
+            TTSTextFrame(text="six", aggregated_by="word"),
+            SleepFrame(0.02),
+            InterruptionFrame(),
+            SleepFrame(0.2),
+            LLMFullResponseStartFrame(),
+            TTSStartedFrame(),
+            TTSTextFrame(text="We", aggregated_by="word"),
+            TTSTextFrame(text="close", aggregated_by="word"),
+            TTSTextFrame(text="at", aggregated_by="word"),
+            TTSTextFrame(text="nine.", aggregated_by="word"),
+            LLMFullResponseEndFrame(),
+            SleepFrame(0.2),
+        ]
+        await run_test(aggregator, frames_to_send=frames_to_send)
+
+        assistant_messages = [m["content"] for m in context.get_messages()]
+        self.assertEqual(
+            assistant_messages,
+            ["The pool opens at six", "We close at nine."],
+        )
+        self.assertEqual([m.interrupted for m in stop_messages], [True, False])
 
     async def test_interruption_keeps_queued_tts_text_in_interrupted_turn(self):
         # The output transport releases each TTSTextFrame as its audio plays, so
