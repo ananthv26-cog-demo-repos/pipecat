@@ -30,6 +30,7 @@ from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     CancelFrame,
+    DataFrame,
     EagerEndOfTurnCancelFrame,
     EagerTranscriptionFrame,
     EndFrame,
@@ -1557,6 +1558,20 @@ class LLMUserAggregator(LLMContextAggregator):
         return True
 
 
+@dataclass
+class _AssistantInterruptionBarrierFrame(DataFrame):
+    """Closes an interrupted assistant turn behind the text the interruption overtook.
+
+    ``InterruptionFrame`` is a system frame, so it is handled ahead of any
+    ``TTSTextFrame`` still waiting in the assistant aggregator's input queue.
+    Those words were already released by the output transport, which means the
+    user heard them. The aggregator queues this frame to itself on
+    interruption so the turn is closed only after that text is aggregated.
+    """
+
+    interruptible: bool = field(default=False, init=False)
+
+
 class LLMAssistantAggregator(LLMContextAggregator):
     """Assistant LLM aggregator that processes bot responses and function calls.
 
@@ -1653,6 +1668,9 @@ class LLMAssistantAggregator(LLMContextAggregator):
         self._push_context_on_bot_stopped_speaking: bool = False
 
         self._assistant_turn_start_timestamp = ""
+        # Set when an interruption cuts the open turn short; the turn is then
+        # reported as interrupted whichever frame ends up closing it.
+        self._assistant_turn_interrupted = False
 
         self._thought_append_to_context = False
         self._thought_llm: str = ""
@@ -1736,6 +1754,8 @@ class LLMAssistantAggregator(LLMContextAggregator):
             await self.push_frame(frame, direction)
         elif isinstance(frame, LLMAssistantPushAggregationFrame):
             await self._handle_push_aggregation()
+        elif isinstance(frame, _AssistantInterruptionBarrierFrame):
+            await self._handle_interruption_barrier()
         elif isinstance(frame, TTSStartedFrame):
             await self._handle_tts_started(frame)
             await self.push_frame(frame, direction)
@@ -1900,6 +1920,13 @@ class LLMAssistantAggregator(LLMContextAggregator):
             await self.push_context_frame(FrameDirection.UPSTREAM)
 
     async def _handle_interruptions(self, frame: InterruptionFrame):
+        if self._assistant_turn_start_timestamp:
+            self._assistant_turn_interrupted = True
+        # Text frames queued before the interruption reached us must still land
+        # in the interrupted turn, so close it from behind them.
+        await self.queue_frame(_AssistantInterruptionBarrierFrame())
+
+    async def _handle_interruption_barrier(self):
         await self._trigger_assistant_turn_stopped(interrupted=True)
         await self.reset()
 
@@ -2413,6 +2440,9 @@ class LLMAssistantAggregator(LLMContextAggregator):
     async def _trigger_assistant_turn_stopped(self, *, interrupted: bool = False):
         if not self._assistant_turn_start_timestamp:
             return
+
+        interrupted = interrupted or self._assistant_turn_interrupted
+        self._assistant_turn_interrupted = False
 
         aggregation = await self.push_aggregation()
         if aggregation:

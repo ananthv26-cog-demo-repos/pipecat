@@ -1995,6 +1995,46 @@ class TestLLMAssistantAggregator(unittest.IsolatedAsyncioTestCase):
             {"role": "assistant", "content": "Hello, how can I help?"},
         )
 
+    async def test_interruption_keeps_queued_tts_text_in_interrupted_turn(self):
+        # The output transport releases each TTSTextFrame as its audio plays, so
+        # text still queued at the aggregator when an InterruptionFrame (a
+        # system frame) overtakes it was heard by the user. It belongs to the
+        # interrupted turn, not to the front of the next one.
+        context = LLMContext()
+        aggregator = LLMAssistantAggregator(context)
+
+        stop_messages = []
+
+        @aggregator.event_handler("on_assistant_turn_stopped")
+        async def on_assistant_turn_stopped(aggregator, message: AssistantTurnStoppedMessage):
+            stop_messages.append(message)
+
+        frames_to_send = [
+            LLMFullResponseStartFrame(),
+            TTSStartedFrame(),
+            TTSTextFrame(text="The", aggregated_by="word"),
+            TTSTextFrame(text="pool", aggregated_by="word"),
+            TTSTextFrame(text="opens", aggregated_by="word"),
+            SleepFrame(0.1),
+            TTSTextFrame(text="at", aggregated_by="word"),
+            TTSTextFrame(text="six", aggregated_by="word"),
+            InterruptionFrame(),
+            SleepFrame(0.2),
+            LLMFullResponseStartFrame(),
+            TTSStartedFrame(),
+            TTSTextFrame(text="We", aggregated_by="word"),
+            TTSTextFrame(text="close", aggregated_by="word"),
+            TTSTextFrame(text="at", aggregated_by="word"),
+            TTSTextFrame(text="nine.", aggregated_by="word"),
+            LLMFullResponseEndFrame(),
+            SleepFrame(0.2),
+        ]
+        await run_test(aggregator, frames_to_send=frames_to_send)
+
+        assistant_messages = [m["content"] for m in context.get_messages()]
+        self.assertEqual(assistant_messages, ["The pool opens at six", "We close at nine."])
+        self.assertEqual([m.interrupted for m in stop_messages], [True, False])
+
     async def test_tts_speak_interruption_records_partial_text(self):
         """Interrupting a TTSSpeakFrame utterance records the partially-spoken text.
 
