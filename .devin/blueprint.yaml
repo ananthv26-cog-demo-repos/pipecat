@@ -1,6 +1,6 @@
 initialize: |
   sudo apt-get update -qq
-  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq pulseaudio pulseaudio-utils alsa-utils espeak-ng portaudio19-dev ffmpeg
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq pulseaudio pulseaudio-utils alsa-utils espeak-ng ffmpeg
 
 maintenance: |
   uv sync --group dev --all-extras --no-extra gstreamer --no-extra local
